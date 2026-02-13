@@ -1,0 +1,10 @@
+{
+  "turn_listen": ":5349",
+  "turn_secret": "optional-shared-secret",
+  "dcc_port_min": 50000,
+  "dcc_port_max": 50100,
+  "relay_host": "irc.example.com",
+  "tls_cert_file": "relay.crt",
+  "tls_key_file": "relay.key",
+  "max_sessions": 100
+}
