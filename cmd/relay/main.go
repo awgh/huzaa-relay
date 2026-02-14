@@ -18,9 +18,14 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	turnUsers := make([]turnrelay.TurnUserCred, 0, len(cfg.TurnUsers))
+	for _, u := range cfg.TurnUsers {
+		turnUsers = append(turnUsers, turnrelay.TurnUserCred{Username: u.Username, Secret: u.Secret})
+	}
 	relayCfg := &turnrelay.RelayConfig{
 		TURNListen:  cfg.TURNListen,
 		TURNSecret:  cfg.TURNSecret,
+		TurnUsers:   turnUsers,
 		DCCPortMin:  cfg.DCCPortMin,
 		DCCPortMax:  cfg.DCCPortMax,
 		RelayHost:   cfg.RelayHost,

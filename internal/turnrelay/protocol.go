@@ -13,6 +13,8 @@ const (
 	MsgData             = 0x04
 	MsgError            = 0x05
 	MsgEOF              = 0x06
+	MsgAuth             = 0x07
+	MsgAuthOk           = 0x08
 )
 
 // Frame: 1 byte type + 4 byte length (big-endian) + payload.
@@ -35,16 +37,30 @@ func ReadFrame(r io.Reader) (msgType byte, payload []byte, err error) {
 	return msgType, payload, nil
 }
 
+// WriteFrame writes one frame. It writes the full header and payload even if the writer returns partial writes.
 func WriteFrame(w io.Writer, msgType byte, payload []byte) error {
 	var h [5]byte
 	h[0] = msgType
 	binary.BigEndian.PutUint32(h[1:5], uint32(len(payload)))
-	if _, err := w.Write(h[:]); err != nil {
+	if err := writeAll(w, h[:]); err != nil {
 		return err
 	}
 	if len(payload) > 0 {
-		_, err := w.Write(payload)
-		return err
+		return writeAll(w, payload)
+	}
+	return nil
+}
+
+// writeAll writes all of p to w, handling partial writes.
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

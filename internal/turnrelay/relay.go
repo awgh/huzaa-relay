@@ -2,12 +2,14 @@ package turnrelay
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -15,6 +17,7 @@ import (
 // Relay runs the TURN relay: DCC front-end and bot-facing TLS.
 type Relay struct {
 	config       *RelayConfig
+	users        userSecrets // username -> secret, built from TurnUsers; nil or empty = no auth
 	sessions     map[string]*Session
 	sessionsMu   sync.RWMutex
 	portPool     *portPool
@@ -22,10 +25,17 @@ type Relay struct {
 	maxSessions  int
 }
 
+// TurnUserCred is one allowed bot credential for auth.
+type TurnUserCred struct {
+	Username string
+	Secret   string
+}
+
 // RelayConfig is the relay configuration used by turnrelay.
 type RelayConfig struct {
 	TURNListen  string
 	TURNSecret  string
+	TurnUsers   []TurnUserCred // allowed username -> secret (lookup built in NewRelay)
 	DCCPortMin  int
 	DCCPortMax  int
 	RelayHost   string
@@ -33,6 +43,9 @@ type RelayConfig struct {
 	TLSKeyFile  string
 	MaxSessions int
 }
+
+// userSecrets maps username -> secret for constant-time lookup (built from TurnUsers).
+type userSecrets map[string]string
 
 func NewRelay(c *RelayConfig) (*Relay, error) {
 	pool, err := newPortPool(c.DCCPortMin, c.DCCPortMax)
@@ -43,8 +56,18 @@ func NewRelay(c *RelayConfig) (*Relay, error) {
 	if maxSessions <= 0 {
 		maxSessions = 100
 	}
+	users := make(userSecrets)
+	for _, u := range c.TurnUsers {
+		if u.Username != "" {
+			users[u.Username] = u.Secret
+		}
+	}
+	if len(users) == 0 {
+		log.Printf("relay: warning: no turn_users defined, all auth will fail")
+	}
 	return &Relay{
 		config:      c,
+		users:       users,
 		sessions:    make(map[string]*Session),
 		portPool:    pool,
 		maxSessions: maxSessions,
@@ -100,6 +123,39 @@ func (r *Relay) handleBotConnection(conn *tls.Conn) {
 		return
 	}
 	defer atomic.AddInt32(&r.currentConns, -1)
+
+	// First frame must be MsgAuth.
+	msgType, payload, err := ReadFrame(conn)
+	if err != nil {
+		if err != io.EOF {
+			log.Printf("relay: bot frame read: %v", err)
+		}
+		return
+	}
+	if msgType != MsgAuth {
+		_ = WriteFrame(conn, MsgError, []byte("auth required"))
+		return
+	}
+	// Payload: 4-byte username length (big-endian), then username, then secret.
+	if len(payload) < 4 {
+		_ = WriteFrame(conn, MsgError, []byte("auth failed"))
+		return
+	}
+	unLen := binary.BigEndian.Uint32(payload[:4])
+	if unLen == 0 || uint32(len(payload)) < 4+unLen || unLen > 256 {
+		_ = WriteFrame(conn, MsgError, []byte("auth failed"))
+		return
+	}
+	username := string(payload[4 : 4+unLen])
+	secret := payload[4+unLen:]
+	expectedSecret, ok := r.users[username]
+	if !ok || subtle.ConstantTimeCompare([]byte(expectedSecret), secret) != 1 {
+		_ = WriteFrame(conn, MsgError, []byte("auth failed"))
+		return
+	}
+	if err := WriteFrame(conn, MsgAuthOk, nil); err != nil {
+		return
+	}
 
 	for {
 		msgType, payload, err := ReadFrame(conn)
@@ -205,7 +261,16 @@ func (r *Relay) listenDCCForSession(ln net.Listener, sessionID string) {
 		return
 	}
 	if sess.Kind == "download" {
-		_, _ = io.Copy(conn, &ChanReader{Ch: sess.BotStream})
+		dest := io.Writer(conn)
+		var cw *countWriter
+		if os.Getenv("RELAY_DEBUG") != "" {
+			cw = &countWriter{w: conn, sessionID: sessionID}
+			dest = cw
+		}
+		n, err := io.Copy(dest, &ChanReader{Ch: sess.BotStream})
+		if cw != nil {
+			log.Printf("[debug] relay download to user session=%s total_written=%d copy_n=%d copy_err=%v", sessionID, cw.n, n, err)
+		}
 		sess.Close()
 	} else {
 		buf := make([]byte, 32*1024)
@@ -227,6 +292,24 @@ func (r *Relay) listenDCCForSession(ln net.Listener, sessionID string) {
 	}
 }
 
+// countWriter wraps an io.Writer and counts bytes; logs progress every 10KB when RELAY_DEBUG is set.
+type countWriter struct {
+	w         io.Writer
+	n         int64
+	sessionID string
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if n > 0 {
+		c.n += int64(n)
+		if os.Getenv("RELAY_DEBUG") != "" && c.n/10240 != (c.n-int64(n))/10240 {
+			log.Printf("[debug] relay download to user session=%s written=%d", c.sessionID, c.n)
+		}
+	}
+	return n, err
+}
+
 func (r *Relay) relayDownloadToUser(botConn *tls.Conn, sessionID string) {
 	r.sessionsMu.RLock()
 	sess, ok := r.sessions[sessionID]
@@ -234,11 +317,18 @@ func (r *Relay) relayDownloadToUser(botConn *tls.Conn, sessionID string) {
 	if !ok {
 		return
 	}
+	debugRelay := os.Getenv("RELAY_DEBUG") != ""
 	for {
 		msgType, payload, err := ReadFrame(botConn)
 		if err != nil {
+			if debugRelay {
+				log.Printf("[debug] relay download frame session=%s read_err=%v", sessionID, err)
+			}
 			sess.Close()
 			return
+		}
+		if debugRelay {
+			log.Printf("[debug] relay download frame type=%d payload_len=%d session=%s", msgType, len(payload), sessionID)
 		}
 		switch msgType {
 		case MsgData:
@@ -248,10 +338,16 @@ func (r *Relay) relayDownloadToUser(botConn *tls.Conn, sessionID string) {
 				return
 			}
 		case MsgEOF:
+			if debugRelay {
+				log.Printf("[debug] relay download session=%s received MsgEOF", sessionID)
+			}
 			close(sess.BotStream)
 			sess.Close()
 			return
 		default:
+			if debugRelay {
+				log.Printf("[debug] relay download session=%s unknown msgType=%d", sessionID, msgType)
+			}
 			sess.Close()
 			return
 		}

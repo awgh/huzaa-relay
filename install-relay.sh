@@ -69,7 +69,9 @@ echo "=== 5. Relay config ==="
 cat > "$RELAY_HOME/relay.json" << EOF
 {
   "turn_listen": ":5349",
-  "turn_secret": "",
+  "turn_users": [
+    { "username": "huzaa-bot", "secret": "REPLACE_WITH_SECRET" }
+  ],
   "dcc_port_min": 50000,
   "dcc_port_max": 50100,
   "relay_host": "${RELAY_DOMAIN}",
